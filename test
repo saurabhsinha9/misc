@@ -1,0 +1,180 @@
+
+<dependencies>
+    <!-- Spark dependencies -->
+    <dependency>
+        <groupId>org.apache.spark</groupId>
+        <artifactId>spark-core_2.12</artifactId>
+        <version>3.2.0</version> <!-- Use your Spark version -->
+    </dependency>
+    
+    <!-- HttpClient 5 for Async HTTP client -->
+    <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpasyncclient</artifactId>
+        <version>5.1</version>
+    </dependency>
+
+    <!-- Additional dependencies -->
+    <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpclient5</artifactId>
+        <version>5.1</version>
+    </dependency>
+</dependencies>
+```
+
+#### 2. HTTP Client Factory with Connection Pooling (for Async Requests)
+
+```java
+import org.apache.http.impl.client.HttpAsyncClients;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.HttpVersion;
+
+import java.util.concurrent.TimeUnit;
+
+public class HttpClientFactory {
+
+    private static final int CONNECTION_TIMEOUT = 5000;
+    private static final int SOCKET_TIMEOUT = 5000;
+    private static final int REQUEST_TIMEOUT = 5000;
+    private static final int MAX_CONNECTIONS_PER_ROUTE = 20;
+    private static final int MAX_TOTAL_CONNECTIONS = 100;
+
+    // Method to create CloseableHttpAsyncClient with connection pooling and timeouts
+    public static CloseableHttpAsyncClient createHttpClient() {
+        PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager();
+        connectionManager.setDefaultMaxPerRoute(MAX_CONNECTIONS_PER_ROUTE); // Max connections per route
+        connectionManager.setMaxTotal(MAX_TOTAL_CONNECTIONS); // Total max connections
+
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS)
+                .setSocketTimeout(SOCKET_TIMEOUT, TimeUnit.MILLISECONDS)
+                .setResponseTimeout(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS)
+                .build();
+
+        CloseableHttpAsyncClient httpClient = HttpAsyncClients.custom()
+                .setDefaultRequestConfig(requestConfig)
+                .setConnectionManager(connectionManager)
+                .setVersion(HttpVersion.HTTP_1_1)
+                .build();
+
+        httpClient.start();
+        return httpClient;
+    }
+}
+```
+
+#### 3. Define a Service to Handle HTTP Requests (with Error Handling)
+
+You can define a class that will handle making HTTP requests asynchronously within Spark. This service will make use of the `CloseableHttpAsyncClient`.
+
+```java
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.http.impl.nio.client.FutureCallback;
+import org.apache.http.HttpResponse;
+import org.apache.http.util.EntityUtils;
+
+public class HttpService {
+
+    private final CloseableHttpAsyncClient httpClient;
+
+    public HttpService(CloseableHttpAsyncClient httpClient) {
+        this.httpClient = httpClient;
+    }
+
+    // Method to execute HTTP requests asynchronously
+    public void executeAsyncRequest(String url) {
+        HttpGet request = new HttpGet(url);
+
+        httpClient.execute(request, new FutureCallback<HttpResponse>() {
+            @Override
+            public void completed(HttpResponse response) {
+                try {
+                    String responseBody = EntityUtils.toString(response.getEntity());
+                    System.out.println("Request completed: " + responseBody);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+
+            @Override
+            public void failed(Exception ex) {
+                System.err.println("Request failed: " + ex.getMessage());
+            }
+
+            @Override
+            public void cancelled() {
+                System.err.println("Request was cancelled");
+            }
+        });
+    }
+}
+```
+
+#### 4. Implement Spark Logic to Use HTTP Service (for Each Partition)
+
+Now, we need to integrate the HTTP service with **Spark RDDs** or **DataFrames** so that each partition makes HTTP requests using the shared connection pool.
+
+```java
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.SparkConf;
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+
+import java.util.List;
+
+public class SparkHttpClientExample {
+
+    public static void main(String[] args) {
+        // Step 1: Create a SparkConf and SparkContext
+        SparkConf conf = new SparkConf().setAppName("Spark HTTP Client Example").setMaster("local[*]");
+        JavaSparkContext sc = new JavaSparkContext(conf);
+
+        // Step 2: Initialize HTTP Async Client
+        CloseableHttpAsyncClient httpClient = HttpClientFactory.createHttpClient();
+        HttpService httpService = new HttpService(httpClient);
+
+        // Step 3: Simulate a dataset (e.g., list of URLs)
+        List<String> urls = List.of(
+            "http://example.com/api/endpoint1",
+            "http://example.com/api/endpoint2",
+            "http://example.com/api/endpoint3"
+        );
+
+        // Step 4: Parallelize the dataset into an RDD
+        JavaRDD<String> urlsRDD = sc.parallelize(urls);
+
+        // Step 5: For each partition, use the HTTP client to make requests
+        urlsRDD.foreachPartition(iterator -> {
+            // For each partition, create a new HttpService with the shared client
+            HttpService partitionHttpService = new HttpService(httpClient);
+
+            // Execute async requests for each URL in the partition
+            while (iterator.hasNext()) {
+                String url = iterator.next();
+                partitionHttpService.executeAsyncRequest(url);
+            }
+        });
+
+        // Wait for some time to allow async tasks to complete (not the best solution for production)
+        try {
+            Thread.sleep(10000);  // Wait for async requests to complete
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+        // Step 6: Close the HTTP client when done
+        try {
+            httpClient.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        // Step 7: Stop the SparkContext
+        sc.stop();
+    }
+}
