@@ -1,180 +1,170 @@
+To create a Spark UDF that makes an HTTP POST asynchronous call using **Apache HttpClient 5** and uses a DataFrame column as the request body, you will need to integrate the Apache HttpClient for HTTP POST requests, handle the async nature of the request, and then register and use the UDF in Spark.
 
+Here's how you can implement this:
+
+### Prerequisites:
+1. **Apache HttpClient 5** for asynchronous HTTP POST requests.
+2. **Spark**: Make sure you are using Spark 3.x or later and Java 11+ for HttpClient.
+
+You will need the following dependencies in your `pom.xml`:
+
+```xml
 <dependencies>
-    <!-- Spark dependencies -->
+    <!-- Spark SQL dependency -->
     <dependency>
         <groupId>org.apache.spark</groupId>
-        <artifactId>spark-core_2.12</artifactId>
-        <version>3.2.0</version> <!-- Use your Spark version -->
-    </dependency>
-    
-    <!-- HttpClient 5 for Async HTTP client -->
-    <dependency>
-        <groupId>org.apache.httpcomponents</groupId>
-        <artifactId>httpasyncclient</artifactId>
-        <version>5.1</version>
+        <artifactId>spark-sql_2.12</artifactId>
+        <version>3.3.0</version>
     </dependency>
 
-    <!-- Additional dependencies -->
+    <!-- Apache HttpClient 5 dependency -->
     <dependency>
         <groupId>org.apache.httpcomponents</groupId>
         <artifactId>httpclient5</artifactId>
-        <version>5.1</version>
+        <version>5.2</version>
+    </dependency>
+    
+    <!-- Apache HttpCore 5 dependency -->
+    <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpcore5</artifactId>
+        <version>5.2</version>
     </dependency>
 </dependencies>
 ```
 
-#### 2. HTTP Client Factory with Connection Pooling (for Async Requests)
+### Step-by-Step Code Implementation
+
+1. **Define the UDF**: We will create a Spark UDF that sends an asynchronous HTTP POST request, and the body of the request will come from a DataFrame column.
 
 ```java
-import org.apache.http.impl.client.HttpAsyncClients;
-import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.spark.sql.api.java.UDF1;
+import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.StringType;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.impl.nio.client.HttpAsyncClients;
 import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
-import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
-import org.apache.http.client.config.RequestConfig;
-import org.apache.http.HttpVersion;
-
-import java.util.concurrent.TimeUnit;
-
-public class HttpClientFactory {
-
-    private static final int CONNECTION_TIMEOUT = 5000;
-    private static final int SOCKET_TIMEOUT = 5000;
-    private static final int REQUEST_TIMEOUT = 5000;
-    private static final int MAX_CONNECTIONS_PER_ROUTE = 20;
-    private static final int MAX_TOTAL_CONNECTIONS = 100;
-
-    // Method to create CloseableHttpAsyncClient with connection pooling and timeouts
-    public static CloseableHttpAsyncClient createHttpClient() {
-        PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager();
-        connectionManager.setDefaultMaxPerRoute(MAX_CONNECTIONS_PER_ROUTE); // Max connections per route
-        connectionManager.setMaxTotal(MAX_TOTAL_CONNECTIONS); // Total max connections
-
-        RequestConfig requestConfig = RequestConfig.custom()
-                .setConnectTimeout(CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS)
-                .setSocketTimeout(SOCKET_TIMEOUT, TimeUnit.MILLISECONDS)
-                .setResponseTimeout(REQUEST_TIMEOUT, TimeUnit.MILLISECONDS)
-                .build();
-
-        CloseableHttpAsyncClient httpClient = HttpAsyncClients.custom()
-                .setDefaultRequestConfig(requestConfig)
-                .setConnectionManager(connectionManager)
-                .setVersion(HttpVersion.HTTP_1_1)
-                .build();
-
-        httpClient.start();
-        return httpClient;
-    }
-}
-```
-
-#### 3. Define a Service to Handle HTTP Requests (with Error Handling)
-
-You can define a class that will handle making HTTP requests asynchronously within Spark. This service will make use of the `CloseableHttpAsyncClient`.
-
-```java
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
-import org.apache.http.impl.nio.client.FutureCallback;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.concurrent.FutureCallback;
 import org.apache.http.HttpResponse;
-import org.apache.http.util.EntityUtils;
+import org.apache.http.HttpEntity;
 
-public class HttpService {
+import java.util.concurrent.Future;
+import java.util.concurrent.CountDownLatch;
 
-    private final CloseableHttpAsyncClient httpClient;
+public class AsyncPostHttpCallUDF implements UDF1<String, String> {
 
-    public HttpService(CloseableHttpAsyncClient httpClient) {
-        this.httpClient = httpClient;
+    private static final CloseableHttpAsyncClient client = HttpAsyncClients.createDefault();
+
+    static {
+        client.start();
     }
 
-    // Method to execute HTTP requests asynchronously
-    public void executeAsyncRequest(String url) {
-        HttpGet request = new HttpGet(url);
+    @Override
+    public String call(String requestBody) throws Exception {
+        // Create the HttpPost request
+        HttpPost httpPost = new HttpPost("https://httpbin.org/post");
+        httpPost.setEntity(new StringEntity(requestBody));
+        httpPost.setHeader("Content-Type", "application/json");
 
-        httpClient.execute(request, new FutureCallback<HttpResponse>() {
+        // Create a latch to wait for async result
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        // Make the asynchronous POST request
+        client.execute(httpPost, new FutureCallback<HttpResponse>() {
             @Override
-            public void completed(HttpResponse response) {
+            public void completed(HttpResponse httpResponse) {
                 try {
-                    String responseBody = EntityUtils.toString(response.getEntity());
-                    System.out.println("Request completed: " + responseBody);
+                    // Get the response body
+                    HttpEntity entity = httpResponse.getEntity();
+                    String responseBody = entity != null ? entity.toString() : "No content";
+                    latch.countDown(); // Release the latch after completion
+                    // You can log the response or return it directly
                 } catch (Exception e) {
+                    latch.countDown();
                     e.printStackTrace();
                 }
             }
 
             @Override
             public void failed(Exception ex) {
-                System.err.println("Request failed: " + ex.getMessage());
+                ex.printStackTrace();
+                latch.countDown();
             }
 
             @Override
             public void cancelled() {
-                System.err.println("Request was cancelled");
+                latch.countDown();
             }
         });
+
+        // Wait for the completion of the HTTP request
+        latch.await();
+
+        return "Request completed";  // Returning a simple string for now
+    }
+
+    // Example of how to use it in your Spark job
+    public static void main(String[] args) {
+        // Normally, you would use the UDF within your Spark job here.
     }
 }
 ```
 
-#### 4. Implement Spark Logic to Use HTTP Service (for Each Partition)
+### Explanation:
 
-Now, we need to integrate the HTTP service with **Spark RDDs** or **DataFrames** so that each partition makes HTTP requests using the shared connection pool.
+1. **Apache HttpClient 5 Async POST**:
+   - We create an `HttpPost` request with the `requestBody` (from the DataFrame column) as the request payload.
+   - We configure an `HttpAsyncClient` to send the request asynchronously.
+   - The `execute` method allows us to specify a `FutureCallback` to handle the result once the request completes.
+
+2. **CountDownLatch**:
+   - We use a `CountDownLatch` to ensure that the async HTTP call is completed before the UDF returns a value.
+
+3. **UDF1 Implementation**:
+   - The `call` method will be executed when the UDF is called within the Spark DataFrame operation.
+   - It sends the POST request and waits for the result asynchronously.
+
+### Step 2: Register the UDF and Use It in a Spark DataFrame
+
+Now that the UDF is created, you can register it in Spark and use it with a DataFrame.
 
 ```java
-import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.SparkConf;
-import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.functions;
+import org.apache.spark.sql.Row;
 
-import java.util.List;
-
-public class SparkHttpClientExample {
+public class SparkAsyncPostHttpExample {
 
     public static void main(String[] args) {
-        // Step 1: Create a SparkConf and SparkContext
-        SparkConf conf = new SparkConf().setAppName("Spark HTTP Client Example").setMaster("local[*]");
-        JavaSparkContext sc = new JavaSparkContext(conf);
+        SparkSession spark = SparkSession.builder().appName("AsyncPostHttpCall").getOrCreate();
 
-        // Step 2: Initialize HTTP Async Client
-        CloseableHttpAsyncClient httpClient = HttpClientFactory.createHttpClient();
-        HttpService httpService = new HttpService(httpClient);
+        // Register the UDF
+        spark.udf().register("async_post_call", new AsyncPostHttpCallUDF(), DataTypes.StringType());
 
-        // Step 3: Simulate a dataset (e.g., list of URLs)
-        List<String> urls = List.of(
-            "http://example.com/api/endpoint1",
-            "http://example.com/api/endpoint2",
-            "http://example.com/api/endpoint3"
-        );
+        // Sample DataFrame
+        String jsonData = "[{\"request_body\": \"{\\\"name\\\": \\\"John\\\"}\"}]";
+        Dataset<Row> df = spark.read().json(spark.createDataset(jsonData, Encoders.STRING()));
 
-        // Step 4: Parallelize the dataset into an RDD
-        JavaRDD<String> urlsRDD = sc.parallelize(urls);
-
-        // Step 5: For each partition, use the HTTP client to make requests
-        urlsRDD.foreachPartition(iterator -> {
-            // For each partition, create a new HttpService with the shared client
-            HttpService partitionHttpService = new HttpService(httpClient);
-
-            // Execute async requests for each URL in the partition
-            while (iterator.hasNext()) {
-                String url = iterator.next();
-                partitionHttpService.executeAsyncRequest(url);
-            }
-        });
-
-        // Wait for some time to allow async tasks to complete (not the best solution for production)
-        try {
-            Thread.sleep(10000);  // Wait for async requests to complete
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-
-        // Step 6: Close the HTTP client when done
-        try {
-            httpClient.close();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        // Step 7: Stop the SparkContext
-        sc.stop();
+        // Use the UDF to make the async HTTP POST call with the 'request_body' column
+        df.withColumn("response", functions.callUDF("async_post_call", df.col("request_body")))
+          .show();
     }
 }
+```
+
+### Explanation of the DataFrame Operations:
+
+- **Registering the UDF**: 
+  - We use `spark.udf().register` to register the `async_post_call` UDF to be used in Spark SQL.
+  
+- **Using the UDF**: 
+  - In the `withColumn` method, we call the registered UDF `async_post_call` and pass the `request_body` column from the DataFrame as an argument.
+
+### Notes:
+- The UDF makes an HTTP POST request asynchronously, and the response will be handled by the callback methods (`completed`, `failed`, `cancelled`).
+- This code uses a simple string `"Request completed"` as the result from the UDF, but you can modify it to return more specific response information such as the response body or status code.
+- The `CountDownLatch` is used to wait for the asynchronous call to finish before the function returns. You can improve this to handle better concurrency and error handling based on your actual use case.
+
+Let me know if you need further clarification or improvements!
